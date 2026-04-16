@@ -1,0 +1,4 @@
+This project includes ExifTool by Phil Harvey
+https://exiftool.org/
+
+Licensed under the Artistic License 2.0
