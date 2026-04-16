@@ -3,3 +3,5 @@ https://exiftool.org/
 
 ExifTool is licensed under the Artistic License 2.0 (or GPL).
 See the LICENSE file in the exiftool directory.
+
+No files were edited, except the file which was originally "exiftool(-k).exe" and was renamed to "exiftool.exe".
