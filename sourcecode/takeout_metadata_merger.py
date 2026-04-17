@@ -210,34 +210,18 @@ def t(key: str, **kwargs) -> str:
 
 EXIFTOOL_URL = "https://exiftool.org/exiftool-13.30_64.zip"
 
-def _get_base_dir() -> Path:
+def _app_dir() -> Path:
     """
-    Gibt das Basisverzeichnis zurück — funktioniert sowohl als .py-Skript
-    als auch als PyInstaller-EXE (--onefile oder --onedir).
-
-    PyInstaller --onefile: entpackt alles nach sys._MEIPASS (temp-Ordner).
-    PyInstaller --onedir:  sys._MEIPASS ist der dist-Ordner mit der exe.
-    Normales Skript:       __file__ Verzeichnis.
+    Verzeichnis neben der laufenden .exe (persistent) — nicht _MEIPASS (temporaer).
+    Im PyInstaller-Build:  Path(sys.executable).parent
+    Im normalen Python:    Path(__file__).parent
     """
-    import sys
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        # Läuft als PyInstaller-Bundle
-        return Path(sys._MEIPASS)
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).parent
     return Path(__file__).parent
 
-def _get_writable_dir() -> Path:
-    """
-    Gibt ein beschreibbares Verzeichnis zurück für Downloads/Cache.
-    Bei EXE: neben der exe-Datei (nicht im temp-MEIPASS der read-only ist).
-    Bei Skript: neben dem Skript.
-    """
-    import sys
-    if getattr(sys, "frozen", False):
-        # sys.executable ist der Pfad zur .exe selbst
-        return Path(sys.executable).parent
-    return Path(__file__).parent
-
-EXIFTOOL_DIR = _get_writable_dir() / "exiftool_bin"
+EXIFTOOL_DIR = _app_dir() / "exiftool_bin"
 EXIFTOOL_EXE = EXIFTOOL_DIR / "exiftool.exe"
 
 # Alle möglichen Truncations von ".supplemental-metadata.json" (vollständig generiert)
@@ -287,25 +271,34 @@ def _is_mp_variant(suffix: str) -> bool:
 def find_exiftool() -> Optional[Path]:
     """
     Sucht exiftool.exe in dieser Reihenfolge:
-    1. Im exiftool_bin/ Unterordner (neben Skript oder neben .exe)
-    2. Im Bundle-Root (sys._MEIPASS) — wenn als PyInstaller-EXE gebündelt
-    3. Im PATH des Systems
-    4. Direkt neben dem Skript / der .exe
+    1. Persistenter Download-Pfad neben der .exe (EXIFTOOL_EXE)
+    2. Im PyInstaller-Bundle (_MEIPASS) — unterstuetzt beide --add-binary Varianten:
+         --add-binary "exiftool.exe;."          -> _MEIPASS/exiftool.exe
+         --add-binary "exiftool.exe;exiftool"   -> _MEIPASS/exiftool/exiftool.exe
+    3. Im System-PATH
+    4. Neben dem Skript (Entwicklungsumgebung)
     """
-    # 1. Bekannter Download-Ordner
+    import sys as _sys
+    # 1. Persistenter Download-Pfad (neben der .exe, bleibt nach Beenden erhalten)
     if EXIFTOOL_EXE.exists():
         return EXIFTOOL_EXE
-    # 2. PyInstaller-Bundle: exiftool.exe wurde mit --add-binary eingebettet
-    base = _get_base_dir()
-    bundled = base / "exiftool.exe"
-    if bundled.exists():
-        return bundled
-    # 3. Im PATH
+    # 2. Im PyInstaller-Bundle suchen
+    if getattr(_sys, "frozen", False):
+        meipass = Path(_sys._MEIPASS)
+        # Variante A: --add-binary "exiftool.exe;."
+        bundled_flat = meipass / "exiftool.exe"
+        if bundled_flat.exists():
+            return bundled_flat
+        # Variante B: --add-binary "exiftool.exe;exiftool"
+        bundled_sub = meipass / "exiftool" / "exiftool.exe"
+        if bundled_sub.exists():
+            return bundled_sub
+    # 3. Im System-PATH
     found = shutil.which("exiftool")
     if found:
         return Path(found)
-    # 4. Neben Skript / exe
-    local = _get_writable_dir() / "exiftool.exe"
+    # 4. Neben dem Skript (Entwicklungsumgebung ohne Bundle)
+    local = Path(__file__).parent / "exiftool.exe"
     if local.exists():
         return local
     return None
@@ -701,60 +694,144 @@ def build_exiftool_args(media_path: Path, meta: dict, exiftool: Path) -> list:
 class ExifToolWorker:
     """
     Hält einen ExifTool-Prozess dauerhaft offen (-stay_open Modus).
-    Eliminiert den Prozess-Start-Overhead: statt N Prozesse nur 1 pro Worker.
-    Typisch 10-50x schneller als einzelne subprocess-Aufrufe.
+    Binary I/O für maximale Windows-Stabilität.
+    Saubere Systemumgebung damit ExifTool nicht mit PyInstaller-DLLs crasht.
+    Auto-Restart bei Prozessabsturz (max. 2x pro Job).
     """
     def __init__(self, exiftool_path: Path):
+        self._exiftool_path = exiftool_path
+        self._env = self._clean_env()
+        self._start_process()
+
+    @staticmethod
+    def _clean_env() -> dict:
+        """
+        Gibt eine saubere Systemumgebung zurück.
+        PyInstaller modifiziert PATH/DLL-Suchpfade — externe Programme wie
+        ExifTool brauchen die originale Systemumgebung, sonst DLL-Konflikte.
+        """
+        import sys as _sys
+        env = os.environ.copy()
+        if getattr(_sys, "frozen", False):
+            for var in ("PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+                orig = env.get(var + "_ORIG")
+                if orig is not None:
+                    env[var] = orig
+                elif var != "PATH":
+                    env.pop(var, None)
+        return env
+
+    def _start_process(self):
+        import queue as _q, sys as _sys
+        # CREATE_NO_WINDOW: verhindert das flackernde Terminal-Fenster auf Windows
+        # (auch wenn die App selbst mit --windowed gebaut wurde, erben Kindprozesse
+        #  ohne dieses Flag trotzdem ein Konsolenfenster)
+        kwargs = {}
+        if _sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+
         self.proc = subprocess.Popen(
-            [str(exiftool_path), "-stay_open", "True", "-@", "-"],
+            [str(self._exiftool_path), "-stay_open", "True", "-@", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,   # separat von stdout halten
-            text=True,
-            bufsize=1,                # line-buffered (kompatibel mit text=True)
+            stderr=subprocess.PIPE,
+            text=False,
+            env=self._env,
+            **kwargs,
         )
-        # stderr-Zeilen in Queue sammeln (nicht verwerfen!)
-        # so können Fehlermeldungen im execute() abgerufen werden
-        import threading, queue as _q
         self._stderr_q = _q.Queue()
+        # Ersten stderr-Output kurz abwarten — wenn ExifTool sofort stirbt
+        # (z.B. wegen falscher Perl-Umgebung), sehen wir den Fehler
+        import time as _time
+        _time.sleep(0.05)
+        if self.proc.poll() is not None:
+            # Prozess tot — stderr lesen für Diagnose
+            err = self.proc.stderr.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ExifTool failed to start: {err or 'no output'}")
         def _collect_stderr():
             try:
-                for line in self.proc.stderr:
-                    self._stderr_q.put(line.rstrip())
+                for raw in self.proc.stderr:
+                    self._stderr_q.put(raw.decode("utf-8", errors="replace").rstrip())
             except Exception:
                 pass
         threading.Thread(target=_collect_stderr, daemon=True).start()
 
-    def execute(self, args: list) -> tuple:
+    def _is_alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def _readline_timeout(self, timeout: float = 30.0):
         """
-        Schickt Argumente an den laufenden ExifTool-Prozess.
-        args: vollständige Liste inkl. exiftool-Pfad als args[0] und Dateipfad am Ende.
-        Gibt (success, output) zurück.
+        Liest eine Zeile von stdout mit Timeout.
+        readline() blockiert ohne Timeout ewig wenn ExifTool hängt.
         """
-        # -echo4 schreibt einen eindeutigen Sentinel auf stdout nach {ready}
-        # so dass wir sicher wissen wann die Ausgabe komplett ist
-        cmd = "\n".join(args[1:]) + "\n-execute\n"
+        import queue as _q
+        result_q = _q.Queue()
+        def _reader():
+            try:
+                result_q.put(self.proc.stdout.readline())
+            except Exception:
+                result_q.put(b"")
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        try:
+            return result_q.get(timeout=timeout)
+        except _q.Empty:
+            return None  # Timeout
+
+    def execute(self, args: list, _retry: int = 0) -> tuple:
+        import re as _re, queue as _q
+        if not self._is_alive():
+            if _retry >= 2:
+                return False, "ExifTool process crashed repeatedly"
+            try:
+                self._start_process()
+            except RuntimeError as e:
+                return False, str(e)
+            return self.execute(args, _retry + 1)
+
+        cmd = ("\n".join(args[1:]) + "\n-execute\n").encode("utf-8")
         try:
             self.proc.stdin.write(cmd)
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            return False, "ExifTool-Prozess unerwartet beendet"
+            if _retry >= 2:
+                return False, "ExifTool process crashed (broken pipe)"
+            try:
+                self._start_process()
+            except RuntimeError as e:
+                return False, str(e)
+            return self.execute(args, _retry + 1)
 
         out_lines = []
         while True:
-            line = self.proc.stdout.readline()
-            if not line:  # Prozess tot
-                return False, "ExifTool-Prozess unerwartet beendet"
-            stripped = line.strip()
-            if stripped == "{ready}":
+            raw = self._readline_timeout(timeout=30.0)
+            if raw is None:
+                # Timeout — ExifTool hängt
+                self.proc.kill()
+                if _retry >= 2:
+                    return False, "ExifTool timed out (30s)"
+                try:
+                    self._start_process()
+                except RuntimeError as e:
+                    return False, str(e)
+                return self.execute(args, _retry + 1)
+            if not raw:
+                # EOF — Prozess tot
+                if _retry >= 2:
+                    return False, "ExifTool process died reading output"
+                try:
+                    self._start_process()
+                except RuntimeError as e:
+                    return False, str(e)
+                return self.execute(args, _retry + 1)
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line == "{ready}":
                 break
-            if stripped:
-                out_lines.append(stripped)
+            if line:
+                out_lines.append(line)
 
         output = "\n".join(out_lines).strip()
 
-        # Stderr-Zeilen holen (nicht blockierend)
-        import re as _re, queue as _q
         stderr_lines = []
         try:
             while True:
@@ -764,29 +841,24 @@ class ExifToolWorker:
         if stderr_lines:
             output = output + ("\n" if output else "") + "\n".join(stderr_lines)
 
-        # Robuster Erfolgs-Check
         updated_match = _re.search(r"(\d+) (?:image|video) files? updated", output)
         if updated_match and int(updated_match.group(1)) > 0:
             return True, output
         if not output or "unchanged" in output.lower():
             return True, output
         lines = [l for l in output.splitlines() if l.strip()]
-        only_warnings = all(
-            l.strip().lower().startswith("warning")
-            for l in lines if l.strip()
-        )
+        only_warnings = all(l.strip().lower().startswith("warning") for l in lines if l.strip())
         if only_warnings and lines:
             return True, output
         return False, output
 
     def close(self):
         try:
-            self.proc.stdin.write("-stay_open\nFalse\n")
+            self.proc.stdin.write(b"-stay_open\nFalse\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
-
 
 def _process_chunk(chunk_args):
     """Worker-Funktion für einen Thread: eigener ExifTool-Prozess pro Worker."""
@@ -841,7 +913,7 @@ def process_takeout(root_dir: str, log_fn, progress_fn, dry_run: bool = False,
     # JSON-Map aufbauen
     log_fn(t("log_scan_json"))
     json_map, prefix_map = build_json_map(root)
-    log_fn(t("log_scan_json_ok", n=len(json_map)))
+    log_fn(t("log_scan_json_ok", n=len(set(str(v) for v in json_map.values()))))
 
     # Alle Mediendateien finden (os.walk ist schneller als rglob auf Windows)
     media_files = []
